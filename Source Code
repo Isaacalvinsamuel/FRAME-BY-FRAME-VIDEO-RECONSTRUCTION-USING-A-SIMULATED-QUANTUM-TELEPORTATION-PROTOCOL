@@ -1,0 +1,139 @@
+import time
+import cv2
+import numpy as np
+from google.colab import files
+from qiskit import QuantumCircuit, ClassicalRegister, QuantumRegister
+from qiskit_aer import AerSimulator
+from base64 import b64encode
+from IPython.display import HTML, display
+
+# ==========================================
+# 1. USER INPUTS & FILE UPLOAD
+# ==========================================
+print("--- Step 1: Upload your video file ---")
+uploaded = files.upload()
+input_video_path = list(uploaded.keys())[0]
+
+PIXEL_RATIO = float(input("Enter pixel ratio (e.g., 0.01 to 0.05): "))
+NUM_SHOTS = int(input("Enter number of quantum shots per pixel (e.g., 50, 100): "))
+AVI_OUTPUT_PATH = "teleported_video.avi"
+MP4_WEB_PATH = "teleported_video_playable.mp4"
+
+print(f"\nConfiguration set:")
+print(f" - Input Video: {input_video_path}")
+print(f" - Pixel Ratio: {PIXEL_RATIO}")
+print(f" - Number of Shots: {NUM_SHOTS}")
+
+# ==========================================
+# 2. VIDEO PROCESSING & FRAME TELEPORTATION
+# ==========================================
+cap = cv2.VideoCapture(input_video_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
+if fps == 0 or np.isnan(fps):
+    fps = 30.0
+
+orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+# Small simulation resolution for speed
+sim_width = max(1, int(orig_width * PIXEL_RATIO))
+sim_height = max(1, int(orig_height * PIXEL_RATIO))
+
+# Target playback resolution (upscaled so browsers can display it)
+play_width = 480
+play_height = int(play_width * (orig_height / orig_width))
+
+print(f"\nQuantum simulation resolution: {sim_width}x{sim_height}")
+print(f"Playback output resolution: {play_width}x{play_height}")
+print(f"Total frames to teleport: {total_frames}")
+
+fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+out = cv2.VideoWriter(AVI_OUTPUT_PATH, fourcc, fps, (play_width, play_height), isColor=False)
+
+simulator = AerSimulator()
+start_time = time.time()
+frame_count = 0
+
+try:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        print(f"--- Teleporting Frame {frame_count}/{total_frames} ---", end="\r")
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        resized_frame = cv2.resize(gray_frame, (sim_width, sim_height), interpolation=cv2.INTER_AREA)
+
+        # Build batch circuits for the small frame
+        circuits = []
+        for y in range(sim_height):
+            for x in range(sim_width):
+                val = resized_frame[y, x] / 255.0
+                theta = float(val) * np.pi
+
+                qr = QuantumRegister(3, 'q')
+                cr = ClassicalRegister(3, 'c')
+                qc = QuantumCircuit(qr, cr)
+
+                qc.ry(theta, qr[0])
+                qc.h(qr[1])
+                qc.cx(qr[1], qr[2])
+                qc.cx(qr[0], qr[1])
+                qc.h(qr[0])
+                qc.measure(qr[0], cr[0])
+                qc.measure(qr[1], cr[1])
+
+                with qc.if_test((cr[1], 1)):
+                    qc.x(qr[2])
+                with qc.if_test((cr[0], 1)):
+                    qc.z(qr[2])
+
+                qc.measure(qr[2], cr[2])
+                circuits.append(qc)
+
+        # Run batch simulation
+        job = simulator.run(circuits, shots=NUM_SHOTS)
+        results = job.result().get_counts()
+
+        # Reconstruct small frame
+        teleported_small = np.zeros((sim_height, sim_width), dtype=np.uint8)
+        idx = 0
+        for y in range(sim_height):
+            for x in range(sim_width):
+                counts = results[idx]
+                ones = sum(val for key, val in counts.items() if key[0] == '1')
+                teleported_small[y, x] = np.clip(int((ones / NUM_SHOTS) * 255), 0, 255)
+                idx += 1
+
+        # Upscale frame using INTER_NEAREST to preserve crisp retro pixel blocks for playback
+        teleported_large = cv2.resize(teleported_small, (play_width, play_height), interpolation=cv2.INTER_NEAREST)
+        out.write(teleported_large)
+
+except Exception as e:
+    print(f"\nError encountered: {e}")
+
+finally:
+    cap.release()
+    out.release()
+    total_time = time.time() - start_time
+    print(f"\n\nProcessing Complete in {total_time:.2f} seconds!")
+
+# ==========================================
+# 3. CONVERT & PLAY INLINE IN COLAB
+# ==========================================
+print("\n--- Converting and embedding video player ---")
+!ffmpeg -y -i teleported_video.avi -vcodec libx264 -pix_fmt yuv420p teleported_video_playable.mp4 -loglevel quiet
+
+mp4_data = open(MP4_WEB_PATH, "rb").read()
+data_url = "data:video/mp4;base64," + b64encode(mp4_data).decode()
+
+display(HTML(f"""
+    <h3>Quantum Teleported Video Output</h3>
+    <video width="480" controls autoplay loop>
+      <source src="{data_url}" type="video/mp4">
+      Your browser does not support the video tag.
+    </video>
+"""))
